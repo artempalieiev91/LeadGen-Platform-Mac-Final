@@ -193,9 +193,9 @@ def render_sheets_preparation() -> None:
 
 **Крок 2:** після кроку 1 через **OpenAI** додаються **Right Company Name** та **Right Title**. Ключ API — **на головній сторінці** (блок OpenAI) або в **Secrets** (`openai_api_key`). Під час роботи можна **Зупинити зі збереженням** — у файлі лишаються вже оброблені рядки.
 
-**Крок 3 (опційно):** після кроку 2 — перевірка **Website** проти **домена з email** (логіка MathcURLs), колонки **Domain** та **Results** (Залишено / Видалено зі статусом MathcURLs); усі рядки лишаються у файлі. Після успішного завершення кроку 3 CSV так само **зберігається в буфер сесії** (кнопка **«Підставити останній CSV знову»** під кроком 2).
+**Крок 3 (опційно):** після кроку 2 — перевірка **Website** проти **домена з email** (логіка MathcURLs), колонки **Domain** та **Results** (Залишено / Видалено зі статусом MathcURLs); усі рядки лишаються у файлі. Після кроку 3 CSV **зберігається в буфер сесії** — та сама кнопка **«Підставити останній CSV знову»**, що й у кроках 2 і 4, підставляє **останній** файл з буфера у вхід поточного кроку.
 
-**Крок 4 (опційно):** для таких рядків очищаються лише **Email** і **Domain**; колонка **Results** **не** змінюється — у ній лишається повний текст «Видалено (…)» з причиною з MathcURLs. Після кроку 4 CSV **зберігається в буфер** так само, як після кроку 3.
+**Крок 4 (опційно):** для таких рядків очищаються лише **Email** і **Domain**; колонка **Results** **не** змінюється — у ній лишається повний текст «Видалено (…)» з причиною з MathcURLs. Після кроку 4 CSV **зберігається в буфер**; під кроком 4 знову **«Підставити останній CSV знову»** для наступної дії.
 
 Крок **removeUnwantedHyperlinks** у CSV недоступний (лише в Google Sheets).
         """
@@ -282,6 +282,9 @@ def render_sheets_preparation() -> None:
                     st.session_state["sheets_prep_step1_out_bytes"] = bytes(out_bytes)
                     st.session_state["sheets_prep_step1_last_log"] = log_text
                     _autosave_after_step1()
+                    st.session_state["sheets_prep_gate_input_at"] = st.session_state.get(
+                        "sheets_prep_buffer_saved_at"
+                    )
                     st.session_state["sheets_prep_preview_after_step"] = 1
                     tg_err = notify_task_finished("Sheets Preparation — крок 1")
                     st.session_state["sheets_prep_tg_err"] = tg_err
@@ -307,8 +310,9 @@ def render_sheets_preparation() -> None:
         "**Right Company Name** та **Right Title** з’являться одразу після **Company Name for Emails** та **Title**. "
         "Під час роботи — **прогрес** і кнопка **Зупинити зі збереженням** (зупинка між батчами OpenAI; поточний запит дораховується). "
         "Після зупинки можна **завантажити частковий CSV**. "
-        "Еталони: `services/sheets_prep_data/company_name_training.csv` та `title_training.csv`. "
-        "Резервні правила — у `services/sheets_preparation_step3_prompts.py`."
+        "Правила назв компаній: `services/sheets_preparation_company_format_rules.py` + фрагмент "
+        "`company_name_training.csv`. Посади: embeddings + exact lookup по `title_training.csv` "
+        "(модель `text-embedding-3-small`), інакше фрагмент файлу. Резерв — `step3_prompts.py`."
     )
 
     buf_for_ai = st.session_state.get("sheets_prep_buffer_bytes")
@@ -412,26 +416,29 @@ def render_sheets_preparation() -> None:
         holder = st.session_state["sheets_prep_ai_holder"]
         stop_ev: threading.Event = st.session_state["sheets_prep_ai_stop_ev"]
 
-        p = float(holder.get("p") or 0.0)
-        prog_ai = st.progress(min(max(p, 0.0), 1.0))
-        lbl_ai = st.empty()
-        lbl_ai.markdown(str(holder.get("msg") or ""))
-
-        if st.button(
-            "Зупинити зі збереженням",
-            type="secondary",
-            key="sheets_prep_ai_stop_btn",
-            help="Сигнал зупинки між батчами OpenAI; поточний запит до API дораховується до кінця.",
-        ):
-            stop_ev.set()
-            st.rerun()
-
-        if not th.is_alive():
+        if th.is_alive():
+            p = float(holder.get("p") or 0.0)
+            prog_ai = st.progress(min(max(p, 0.0), 1.0))
+            lbl_ai = st.empty()
+            lbl_ai.markdown(str(holder.get("msg") or ""))
+            if st.button(
+                "Зупинити зі збереженням",
+                type="secondary",
+                key="sheets_prep_ai_stop_btn",
+                help="Сигнал зупинки між батчами OpenAI; поточний запит до API дораховується до кінця.",
+            ):
+                stop_ev.set()
+                st.rerun()
+            st.info(
+                "**Крок 3 не прихований** — він уже нижче на цій же вкладці. **Прокрутіть сторінку вниз** після цього блоку: "
+                "заголовок **«Крок 3: Website ↔ домен email»** і велика кнопка **«Підставити останній CSV знову»**. "
+                "Після завершення кроку 2 кнопка **«Запустити крок 3»** стане активною, коли в сесії з’явиться CSV "
+                "(автоматично після AI або через **Підставити…** / завантаження файлу)."
+            )
+        else:
             st.session_state["sheets_prep_ai_bg_running"] = False
             err = holder.get("error")
             if err:
-                prog_ai.progress(0)
-                lbl_ai.markdown("")
                 st.error(str(err))
             else:
                 out_ai = holder.get("out_rows")
@@ -448,6 +455,9 @@ def render_sheets_preparation() -> None:
                     st.session_state["sheets_preparation_out_bytes"] = rows_to_csv_bytes(out_ai)
                     st.session_state["sheets_preparation_last_log"] = combined
                     _autosave_after_ai_step()
+                    st.session_state["sheets_prep_gate_input_at"] = st.session_state.get(
+                        "sheets_prep_buffer_saved_at"
+                    )
                     st.session_state["sheets_prep_preview_after_step"] = 2
                     st.session_state["sheets_prep_ai_last_partial"] = stopped
                     if stopped:
@@ -459,9 +469,6 @@ def render_sheets_preparation() -> None:
             st.session_state.pop("sheets_prep_ai_stop_ev", None)
             st.session_state.pop("sheets_prep_ai_holder", None)
             st.rerun()
-
-        time.sleep(1.0)
-        st.rerun()
 
     if (
         st.session_state.get("sheets_prep_preview_after_step") == 2
@@ -481,19 +488,54 @@ def render_sheets_preparation() -> None:
 
     st.divider()
     st.markdown("### Крок 3: Website ↔ домен email (MathcURLs)")
+    st.markdown("**Крок 3 — підставити CSV з буфера:**")
     st.caption(
-        "Джерело — поточний CSV після **кроку 2** (`sheets_preparation_out_bytes`). Для рядків із валідним email порівнюються **Website** і **домен з адреси** "
-        "(та сама логіка, що на вкладці MathcURLs: HTTP, за потреби Chromium). "
-        "Колонка **Domain** — одразу після **Email**, **Results** — одразу після **Domain**. "
-        "У **Results**: «Залишено (Matched / …)» або «Видалено (One of websites is dead / …)» — той самий текст статусу, що в output MathcURLs. "
-        "Рядки **без** валідного домена в email: Domain і Results порожні."
+        "Як у кроку 2: натисніть велику кнопку нижче, потім **Запустити крок 3**. Буфер оновлюється після кожного кроку 1–4."
     )
 
     st.session_state.setdefault("sheets_prep_gate_requested", False)
     st.session_state.setdefault("sheets_prep_gate_bg_running", False)
 
-    gate_src = st.session_state.get("sheets_preparation_out_bytes")
     gate_busy = st.session_state.get("sheets_prep_gate_bg_running", False)
+    buf_for_gate = st.session_state.get("sheets_prep_buffer_bytes")
+
+    if st.button(
+        "Підставити останній CSV знову",
+        key="sheets_prep_gate_reload",
+        help="Підставити останній збережений CSV (після кроку 1, 2, 3 або 4). Буфер з’являється вже після кроку 1.",
+        use_container_width=True,
+    ):
+        if buf_for_gate is None:
+            st.warning(
+                "У буфері сесії ще немає CSV. Виконайте **крок 1** (або крок 2), або завантажте файл з диска нижче."
+            )
+        else:
+            st.session_state["sheets_preparation_out_bytes"] = bytes(buf_for_gate)
+            st.session_state["sheets_prep_gate_input_at"] = datetime.now().isoformat(
+                timespec="seconds"
+            )
+            st.session_state["sheets_prep_preview_after_step"] = 2
+            st.session_state.pop("sheets_prep_gate_out_bytes", None)
+            st.session_state.pop("sheets_prep_gate_log", None)
+            st.session_state.pop("sheets_prep_step4_out_bytes", None)
+            st.session_state.pop("sheets_prep_step4_log", None)
+            st.success("CSV для кроку 3 оновлено.")
+
+    _gs = st.session_state.get("sheets_preparation_out_bytes")
+    if _gs:
+        _tsg = st.session_state.get("sheets_prep_gate_input_at") or "—"
+        st.caption(f"Для кроку 3: **{len(_gs):,}** байт · `{_tsg}`")
+
+    with st.expander("Деталі: що робить крок 3 (MathcURLs)", expanded=False):
+        st.markdown(
+            "Джерело — поточний CSV після **кроку 2** (`sheets_preparation_out_bytes`). Для рядків із валідним email "
+            "порівнюються **Website** і **домен з адреси** (та сама логіка, що на вкладці MathcURLs: HTTP, за потреби Chromium). "
+            "Колонка **Domain** — одразу після **Email**, **Results** — одразу після **Domain**. "
+            "У **Results**: «Залишено (Matched / …)» або «Видалено (One of websites is dead / …)» — той самий текст статусу, що в output MathcURLs. "
+            "Рядки **без** валідного домена в email: Domain і Results порожні."
+        )
+
+    gate_src = st.session_state.get("sheets_preparation_out_bytes")
 
     if not st.session_state.get("sheets_prep_gate_requested", False) and not gate_busy:
         if st.button(
@@ -501,7 +543,9 @@ def render_sheets_preparation() -> None:
             type="primary",
             key="sheets_prep_gate_btn",
             disabled=not gate_src,
-            help=None if gate_src else "Спочатку виконайте крок 1 і крок 2 — з’явиться CSV з Right Company / Right Title.",
+            help=None
+            if gate_src
+            else "Спочатку виконайте **крок 1 і крок 2** (або **Підставити останній CSV знову** / файл нижче).",
         ):
             st.session_state["sheets_prep_gate_requested"] = True
             st.session_state.pop("sheets_prep_gate_out_bytes", None)
@@ -509,6 +553,37 @@ def render_sheets_preparation() -> None:
             st.session_state.pop("sheets_prep_step4_out_bytes", None)
             st.session_state.pop("sheets_prep_step4_log", None)
             st.rerun()
+
+    if not gate_src:
+        if buf_for_gate is None:
+            st.caption(
+                "Спочатку виконайте **крок 1 і крок 2** — тоді CSV підставиться автоматично "
+                "(або **Підставити останній CSV знову** / завантажте файл нижче)."
+            )
+        else:
+            st.caption(
+                "Немає CSV для кроку 3 у сесії. Натисніть **Підставити останній CSV знову** або завантажте файл нижче."
+            )
+
+    gate_upload = st.file_uploader(
+        "Або завантажте CSV з диска (наприклад вихід після кроку 2)",
+        type=["csv"],
+        key="sheets_prep_gate_file",
+        help="Якщо буфер порожній або потрібен інший файл.",
+    )
+    if gate_upload is not None:
+        _sig = (gate_upload.name, getattr(gate_upload, "size", None), len(gate_upload.getvalue()))
+        if st.session_state.get("_sheets_prep_gate_upload_sig") != _sig:
+            st.session_state["_sheets_prep_gate_upload_sig"] = _sig
+            st.session_state["sheets_preparation_out_bytes"] = gate_upload.getvalue()
+            st.session_state["sheets_prep_gate_input_at"] = datetime.now().isoformat(
+                timespec="seconds"
+            )
+            st.session_state["sheets_prep_preview_after_step"] = 2
+            st.session_state.pop("sheets_prep_gate_out_bytes", None)
+            st.session_state.pop("sheets_prep_gate_log", None)
+            st.session_state.pop("sheets_prep_step4_out_bytes", None)
+            st.session_state.pop("sheets_prep_step4_log", None)
 
     if st.session_state.get("sheets_prep_gate_requested"):
         st.session_state["sheets_prep_gate_requested"] = False
@@ -565,20 +640,20 @@ def render_sheets_preparation() -> None:
         holder_gate = st.session_state["sheets_prep_gate_holder"]
         stop_gate: threading.Event = st.session_state["sheets_prep_gate_stop_ev"]
 
-        pg = float(holder_gate.get("p") or 0.0)
-        st.progress(min(max(pg, 0.0), 1.0))
-        st.caption(str(holder_gate.get("msg") or ""))
-
-        if st.button(
-            "Зупинити (крок 3)",
-            type="secondary",
-            key="sheets_prep_gate_stop_btn",
-            help="Сигнал між рядками перевірки; поточна пара може бути дорахована до кінця.",
-        ):
-            stop_gate.set()
-            st.rerun()
-
-        if not th_gate.is_alive():
+        if th_gate.is_alive():
+            pg = float(holder_gate.get("p") or 0.0)
+            st.progress(min(max(pg, 0.0), 1.0))
+            st.caption(str(holder_gate.get("msg") or ""))
+            if st.button(
+                "Зупинити (крок 3)",
+                type="secondary",
+                key="sheets_prep_gate_stop_btn",
+                help="Сигнал між рядками перевірки; поточна пара може бути дорахована до кінця.",
+            ):
+                stop_gate.set()
+                st.rerun()
+            st.caption("Крок 4 нижче вже на сторінці — після завершення кроку 3 підставте буфер у крок 4.")
+        else:
             st.session_state["sheets_prep_gate_bg_running"] = False
             err_g = holder_gate.get("error")
             if err_g:
@@ -589,6 +664,9 @@ def render_sheets_preparation() -> None:
                 st.session_state["sheets_prep_gate_out_bytes"] = holder_gate.get("bytes") or b""
                 st.session_state["sheets_prep_gate_log"] = holder_gate.get("log") or ""
                 _autosave_after_step3()
+                st.session_state["sheets_prep_step4_input_at"] = st.session_state.get(
+                    "sheets_prep_buffer_saved_at"
+                )
                 tg_g = notify_task_finished("Sheets Preparation — крок 3")
                 st.session_state["sheets_prep_gate_tg_err"] = tg_g
             st.session_state.pop("sheets_prep_gate_thread", None)
@@ -596,13 +674,10 @@ def render_sheets_preparation() -> None:
             st.session_state.pop("sheets_prep_gate_holder", None)
             st.rerun()
 
-        time.sleep(1.0)
-        st.rerun()
-
     if st.session_state.get("sheets_prep_gate_out_bytes") is not None:
         st.success("Крок 3 завершено — нижче завантаження CSV з колонками Domain та Results.")
         st.caption(
-            "Результат збережено в **буфер сесії** — під кроком 2 кнопка **«Підставити останній CSV знову»** підставить цей файл."
+            "Результат збережено в **буфер сесії** — кнопка **«Підставити останній CSV знову»** у **кроку 3** або **кроку 4** підставить цей файл."
         )
         tg_ge = st.session_state.get("sheets_prep_gate_tg_err")
         if tg_ge:
@@ -619,15 +694,66 @@ def render_sheets_preparation() -> None:
 
     st.divider()
     st.markdown("### Крок 4: Видалити погані емейли")
+    st.markdown("**Крок 4 — підставити CSV з буфера:**")
     st.caption(
-        "Джерело — **CSV після кроку 3**. Якщо в **Results** — «Видалено (One of websites is dead)» або "
-        "«Видалено (No Redirect or not Match)», у цьому рядку очищаються лише **Email** і **Domain**. "
-        "**Results не чіпаємо** — там залишається повний статус MathcURLs, щоб було видно причину відсутності email. "
-        "Після виконання результат **зберігається в буфер сесії** — кнопка **«Підставити останній CSV знову»** під кроком 2."
+        "Потрібен файл **після кроку 3** (колонки Domain та Results). Натисніть **Підставити останній CSV знову** — у вхід піде "
+        "останній збережений у сесії CSV (зазвичай це вихід кроку 3). Деталі логіки — у розгорнутому блоці."
     )
+
+    buf_for_step4 = st.session_state.get("sheets_prep_buffer_bytes")
+    if st.button(
+        "Підставити останній CSV знову",
+        key="sheets_prep_step4_reload",
+        help="Підставити останній CSV з буфера у вхід кроку 4 (очікується вихід кроку 3 з Domain/Results).",
+        use_container_width=True,
+    ):
+        if buf_for_step4 is None:
+            st.warning("У буфері сесії ще немає CSV. Спочатку виконайте крок 3 або завантажте файл нижче.")
+        else:
+            st.session_state["sheets_prep_gate_out_bytes"] = bytes(buf_for_step4)
+            st.session_state["sheets_prep_step4_input_at"] = datetime.now().isoformat(
+                timespec="seconds"
+            )
+            st.session_state.pop("sheets_prep_step4_out_bytes", None)
+            st.session_state.pop("sheets_prep_step4_log", None)
+            st.success("CSV для кроку 4 оновлено з буфера.")
+
+    _g4 = st.session_state.get("sheets_prep_gate_out_bytes")
+    if _g4:
+        _ts4 = st.session_state.get("sheets_prep_step4_input_at") or "—"
+        st.caption(f"Для кроку 4: **{len(_g4):,}** байт · `{_ts4}`")
+
+    with st.expander("Деталі: що робить крок 4", expanded=False):
+        st.markdown(
+            "Якщо в **Results** — «Видалено (One of websites is dead)» або «Видалено (No Redirect or not Match)», "
+            "у цьому рядку очищаються лише **Email** і **Domain**. **Results не змінюємо**. "
+            "Після виконання результат зберігається в **буфер сесії**."
+        )
+
+    step4_upload = st.file_uploader(
+        "Або завантажте CSV після кроку 3 з диска",
+        type=["csv"],
+        key="sheets_prep_step4_file",
+        help="Якщо потрібен конкретний файл з Domain та Results.",
+    )
+    if step4_upload is not None:
+        _sig4 = (step4_upload.name, getattr(step4_upload, "size", None), len(step4_upload.getvalue()))
+        if st.session_state.get("_sheets_prep_step4_upload_sig") != _sig4:
+            st.session_state["_sheets_prep_step4_upload_sig"] = _sig4
+            st.session_state["sheets_prep_gate_out_bytes"] = step4_upload.getvalue()
+            st.session_state["sheets_prep_step4_input_at"] = datetime.now().isoformat(
+                timespec="seconds"
+            )
+            st.session_state.pop("sheets_prep_step4_out_bytes", None)
+            st.session_state.pop("sheets_prep_step4_log", None)
 
     gate_for_step4 = st.session_state.get("sheets_prep_gate_out_bytes")
     step4_ready = gate_for_step4 is not None and len(gate_for_step4) > 0
+
+    if not step4_ready:
+        st.caption(
+            "Щоб увімкнути **Видалити погані емейли**: виконайте крок 3 або натисніть **Підставити останній CSV знову** / завантажте CSV вище."
+        )
 
     if st.button(
         "Видалити погані емейли",
@@ -636,7 +762,7 @@ def render_sheets_preparation() -> None:
         disabled=not step4_ready,
         help=None
         if step4_ready
-        else "Спочатку виконайте крок 3 — потрібен CSV з колонками Domain та Results.",
+        else "Підставте CSV з буфера / з диска (потрібен вихід кроку 3: Domain та Results).",
     ):
         try:
             out_b, log_s4 = strip_bad_emails_from_csv_bytes(bytes(gate_for_step4))
@@ -666,3 +792,14 @@ def render_sheets_preparation() -> None:
                 "підставить цей CSV."
             ),
         )
+
+    if st.session_state.get("sheets_prep_ai_bg_running"):
+        _th_poll = st.session_state.get("sheets_prep_ai_thread")
+        if _th_poll is not None and _th_poll.is_alive():
+            time.sleep(1.0)
+            st.rerun()
+    if st.session_state.get("sheets_prep_gate_bg_running"):
+        _tg_poll = st.session_state.get("sheets_prep_gate_thread")
+        if _tg_poll is not None and _tg_poll.is_alive():
+            time.sleep(1.0)
+            st.rerun()
