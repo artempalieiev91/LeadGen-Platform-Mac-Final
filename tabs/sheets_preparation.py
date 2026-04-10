@@ -24,6 +24,8 @@ from services.sheets_prep_strip_bad_emails import strip_bad_emails_from_csv_byte
 from services.telegram_notify import notify_task_finished
 
 _PREVIEW_MAX_ROWS = 10
+# Маркер у UI: якщо не видно в підзаголовку вкладки — запущено стару копію коду / без git pull.
+SHEETS_PREP_UI_MARK = "Sheets UI: buffer-reload v2 (кроки 2–4)"
 
 
 def _migrate_legacy_sheets_prep_session() -> None:
@@ -184,6 +186,7 @@ def _autosave_after_step4() -> None:
 
 def render_sheets_preparation() -> None:
     st.subheader("Sheets Preparation")
+    st.caption(SHEETS_PREP_UI_MARK)
     _migrate_legacy_sheets_prep_session()
 
     st.markdown(
