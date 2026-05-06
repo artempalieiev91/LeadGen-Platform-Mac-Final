@@ -10,9 +10,10 @@ import streamlit as st
 
 from services.sheets_preparation_pipeline import (
     OUTPUT_COLUMN_ORDER,
+    SOURCE_CSV_COLUMN,
     parse_csv_bytes,
     rows_to_csv_bytes,
-    run_sheets_preparation_pipeline,
+    run_sheets_preparation_pipeline_multi,
 )
 from services.platform_openai import openai_api_key_effective
 from services.sheets_prep_email_domain_gate import (
@@ -25,7 +26,7 @@ from services.telegram_notify import notify_task_finished
 
 _PREVIEW_MAX_ROWS = 10
 # Маркер у UI: якщо не видно в підзаголовку вкладки — запущено стару копію коду / без git pull.
-SHEETS_PREP_UI_MARK = "Sheets UI: buffer-reload v2 (кроки 2–4)"
+SHEETS_PREP_UI_MARK = "Sheets UI: buffer-reload v7 (кроки 2–4)"
 
 
 def _migrate_legacy_sheets_prep_session() -> None:
@@ -129,10 +130,12 @@ def _render_current_output_preview_and_download(
         st.code(_log_show, language="text")
 
 
-def _write_session_csv_copies(b: bytes) -> str:
+def _write_session_csv_copies(b: bytes, *, source: str | None = None) -> str:
     now = datetime.now().isoformat(timespec="seconds")
     st.session_state["sheets_prep_buffer_bytes"] = b
     st.session_state["sheets_prep_buffer_saved_at"] = now
+    if source:
+        st.session_state["sheets_prep_buffer_source"] = source
     return now
 
 
@@ -142,7 +145,9 @@ def _autosave_after_step1() -> None:
     if not out:
         return
     b = bytes(out)
-    now_s = _write_session_csv_copies(b)
+    now_s = _write_session_csv_copies(
+        b, source="Sheets Preparation — крок 1 (підготовка CSV)"
+    )
     st.session_state["sheets_prep_for_ai_bytes"] = b
     st.session_state["sheets_prep_for_ai_at"] = now_s
 
@@ -153,7 +158,10 @@ def _autosave_after_ai_step() -> None:
     if not out:
         return
     b = bytes(out)
-    now_s = _write_session_csv_copies(b)
+    now_s = _write_session_csv_copies(
+        b,
+        source="Sheets Preparation — крок 2 (AI: Right Company Name, Right Title)",
+    )
     st.session_state["sheets_prep_for_ai_bytes"] = b
     st.session_state["sheets_prep_for_ai_at"] = now_s
 
@@ -166,7 +174,9 @@ def _autosave_after_step3() -> None:
     b = bytes(out)
     if not b:
         return
-    now_s = _write_session_csv_copies(b)
+    now_s = _write_session_csv_copies(
+        b, source="Sheets Preparation — крок 3 (Website ↔ домен email, MathcURLs)"
+    )
     st.session_state["sheets_prep_for_ai_bytes"] = b
     st.session_state["sheets_prep_for_ai_at"] = now_s
 
@@ -179,7 +189,9 @@ def _autosave_after_step4() -> None:
     b = bytes(out)
     if not b:
         return
-    now_s = _write_session_csv_copies(b)
+    now_s = _write_session_csv_copies(
+        b, source="Sheets Preparation — крок 4 (очищення Email / Domain)"
+    )
     st.session_state["sheets_prep_for_ai_bytes"] = b
     st.session_state["sheets_prep_for_ai_at"] = now_s
 
@@ -189,10 +201,26 @@ def render_sheets_preparation() -> None:
     st.caption(SHEETS_PREP_UI_MARK)
     _migrate_legacy_sheets_prep_session()
 
+    if (
+        st.session_state.get("sheets_preparation_data")
+        and not st.session_state.get("sheets_preparation_inputs")
+    ):
+        _b = st.session_state.get("sheets_preparation_data")
+        _n = st.session_state.get("sheets_preparation_name") or "import.csv"
+        if _b and len(_b) > 0:
+            st.session_state["sheets_preparation_inputs"] = [(bytes(_b), str(_n))]
+
     st.markdown(
-        """
-Завантажте **CSV** з **будь-якою кількістю стовпців**: з інпуту беруться лише **ключові поля**. У **кінець** таблиці переносяться **Apollo Contact Id** та **Apollo Account Id** 
-(якщо відповідні колонки вже є у файлі — значення зберігаються по рядках). Далі — як у `automateProcess`: локація людини → Industry → URL.
+        f"""
+**Крок 1 — один або кілька CSV.** Можна обрати **кілька файлів `.csv`**: усі склеюються в **одну таблицю** з **одним заголовком**, рядки з усіх файлів ідуть **підряд**.
+
+**Перша колонка результату** завжди **`{SOURCE_CSV_COLUMN}`**: у кожному рядку вказано джерело — **ім’я файлу без `.csv`**. Якщо два файли дали б однакову коротку назву, друга й наступні копії отримують суфікси **пробіл (2)**, **пробіл (3)** тощо.
+
+**Навіщо це потрібно:** злити кілька вивантажень у один файл і одразу бачити **джерело рядка** без ручної колонки в кожному CSV. Решта колонок кроку 1 — стандартний порядок полів платформи; з різних вхідних файлів підтягуються **ті самі логічні поля**, навіть якщо в кожному файлі був **свій набір стовпців**.
+
+Це **розширений крок 1** як у Windows-версії: на Mac після перенесення коду текст і поведінка мають збігатися.
+
+Далі — як у `automateProcess`: локація людини → Industry → URL. У **кінець** таблиці додаються **Apollo Contact Id** та **Apollo Account Id** (з кожного вихідного файлу окремо, якщо колонки були).
 
 **Крок 2:** після кроку 1 через **OpenAI** додаються **Right Company Name** та **Right Title**. Ключ API — **на головній сторінці** (блок OpenAI) або в **Secrets** (`openai_api_key`). Під час роботи можна **Зупинити зі збереженням** — у файлі лишаються вже оброблені рядки.
 
@@ -209,24 +237,23 @@ def render_sheets_preparation() -> None:
 
     st.markdown("### Крок 1: Підготовка CSV")
     st.caption(
-        "Завантажте файл і натисніть **Запустити підготовку**. Після кроку 1 з’явиться **прев’ю перших 10 рядків** і **завантаження CSV**; нижче — **крок 2 (AI)**."
+        "Завантажте один або кілька файлів і натисніть **Запустити підготовку**. Після кроку 1 — прев’ю та завантаження CSV, нижче — **крок 2 (AI)**."
     )
 
     uploaded = st.file_uploader(
-        "Вхідний CSV",
+        "Вхідний CSV (можна кілька)",
         type=["csv"],
+        accept_multiple_files=True,
         key="sheets_preparation_uploader",
-        help="Багато стовпців OK. У кінці кроку 1: Apollo Contact Id та Apollo Account Id (якщо були в інпуті).",
+        help=f"Один або кілька файлів. Результат містить «{SOURCE_CSV_COLUMN}» і стандартні поля, у кінці — Apollo Contact Id та Apollo Account Id за наявності в кожному джерелі.",
     )
 
-    if uploaded is not None:
-        data = uploaded.getvalue()
-        name = uploaded.name
-        prev_bytes = st.session_state.get("sheets_preparation_data")
-        prev_name = st.session_state.get("sheets_preparation_name")
-        if prev_bytes != data or prev_name != name:
-            st.session_state["sheets_preparation_data"] = data
-            st.session_state["sheets_preparation_name"] = name
+    if uploaded:
+        payloads = [(f.getvalue(), f.name) for f in uploaded]
+        sig = tuple((f.name, getattr(f, "size", None), len(f.getvalue())) for f in uploaded)
+        if st.session_state.get("sheets_prep_upload_sig") != sig:
+            st.session_state["sheets_prep_upload_sig"] = sig
+            st.session_state["sheets_preparation_inputs"] = payloads
             st.session_state.pop("sheets_preparation_out_bytes", None)
             st.session_state.pop("sheets_preparation_last_log", None)
             st.session_state.pop("sheets_prep_tg_err", None)
@@ -239,17 +266,19 @@ def render_sheets_preparation() -> None:
             st.session_state.pop("sheets_prep_gate_log", None)
             st.session_state.pop("sheets_prep_step4_out_bytes", None)
             st.session_state.pop("sheets_prep_step4_log", None)
-        st.caption(f"**{name}** · {uploaded.size:,} байт")
-    elif st.session_state.get("sheets_preparation_data"):
-        name = st.session_state.get("sheets_preparation_name") or "файл"
-        st.caption(f"**{name}** · дані з попереднього завантаження в сесії")
+        total_b = sum(len(b) for b, _ in payloads)
+        names_line = ", ".join(f"**{n}**" for _, n in payloads)
+        st.caption(f"**{len(payloads)}** файл(ів): {names_line} · усього **{total_b:,}** байт")
+    elif st.session_state.get("sheets_preparation_inputs"):
+        pairs = st.session_state["sheets_preparation_inputs"]
+        total_b = sum(len(b) for b, _ in pairs)
+        names_line = ", ".join(f"**{n}**" for _, n in pairs)
+        st.caption(f"**{len(pairs)}** файл(ів) з сесії: {names_line} · **{total_b:,}** байт")
     else:
-        st.info("Завантажте CSV — дані зберігаються в сесії після вибору файлу.")
+        st.info("Завантажте один або кілька CSV — список зберігається в сесії після вибору.")
 
-    # Після натискання іншої кнопки file_uploader часто повертає None — покладаємось на session_state;
-    # bool(b"") дає False, тому перевіряємо len.
-    _stored = st.session_state.get("sheets_preparation_data")
-    has_input = uploaded is not None or (_stored is not None and len(_stored) > 0)
+    _stored_inputs = st.session_state.get("sheets_preparation_inputs") or []
+    has_input = bool(uploaded) or len(_stored_inputs) > 0
 
     if "sheets_prep_run" not in st.session_state:
         st.session_state["sheets_prep_run"] = False
@@ -263,35 +292,30 @@ def render_sheets_preparation() -> None:
     # Виконувати обробку поза «if has_input»: інакше після rerun без файлу у віджеті has_input міг стати False і пайплайн не запускався.
     if st.session_state["sheets_prep_run"]:
         st.session_state["sheets_prep_run"] = False
-        raw = st.session_state.get("sheets_preparation_data") or b""
-        if len(raw) == 0:
-            st.error("Немає даних CSV у сесії. Завантажте файл ще раз і натисніть «Запустити підготовку».")
+        inputs = list(st.session_state.get("sheets_preparation_inputs") or [])
+        if not inputs:
+            st.error("Немає даних CSV у сесії. Завантажте файл(и) ще раз і натисніть «Запустити підготовку».")
         else:
-            try:
-                rows = parse_csv_bytes(raw)
-            except Exception as exc:
-                st.error(f"Не вдалося прочитати CSV: {exc}")
-            else:
-                out_rows, err, log_lines = run_sheets_preparation_pipeline(rows)
-                log_text = "\n".join(log_lines)
+            out_rows, err, log_lines = run_sheets_preparation_pipeline_multi(inputs)
+            log_text = "\n".join(log_lines)
 
-                if err:
-                    st.error(err)
-                    st.code(log_text or "(немає журналу)", language="text")
-                else:
-                    out_bytes = rows_to_csv_bytes(out_rows)
-                    st.session_state["sheets_preparation_out_bytes"] = out_bytes
-                    st.session_state["sheets_preparation_last_log"] = log_text
-                    st.session_state["sheets_prep_step1_out_bytes"] = bytes(out_bytes)
-                    st.session_state["sheets_prep_step1_last_log"] = log_text
-                    _autosave_after_step1()
-                    st.session_state["sheets_prep_gate_input_at"] = st.session_state.get(
-                        "sheets_prep_buffer_saved_at"
-                    )
-                    st.session_state["sheets_prep_preview_after_step"] = 1
-                    tg_err = notify_task_finished("Sheets Preparation — крок 1")
-                    st.session_state["sheets_prep_tg_err"] = tg_err
-                    st.rerun()
+            if err:
+                st.error(err)
+                st.code(log_text or "(немає журналу)", language="text")
+            else:
+                out_bytes = rows_to_csv_bytes(out_rows)
+                st.session_state["sheets_preparation_out_bytes"] = out_bytes
+                st.session_state["sheets_preparation_last_log"] = log_text
+                st.session_state["sheets_prep_step1_out_bytes"] = bytes(out_bytes)
+                st.session_state["sheets_prep_step1_last_log"] = log_text
+                _autosave_after_step1()
+                st.session_state["sheets_prep_gate_input_at"] = st.session_state.get(
+                    "sheets_prep_buffer_saved_at"
+                )
+                st.session_state["sheets_prep_preview_after_step"] = 1
+                tg_err = notify_task_finished("Sheets Preparation — крок 1")
+                st.session_state["sheets_prep_tg_err"] = tg_err
+                st.rerun()
 
     if st.session_state.get("sheets_prep_step1_out_bytes"):
         st.divider()
@@ -309,35 +333,32 @@ def render_sheets_preparation() -> None:
     st.divider()
     st.markdown("### Крок 2: Right Company Name та Right Title (AI)")
     st.caption(
-        "Джерело — CSV після **кроку 1** (підставляється автоматично). Після запуску колонки "
-        "**Right Company Name** та **Right Title** з’являться одразу після **Company Name for Emails** та **Title**. "
-        "Під час роботи — **прогрес** і кнопка **Зупинити зі збереженням** (зупинка між батчами OpenAI; поточний запит дораховується). "
-        "Після зупинки можна **завантажити частковий CSV**. "
-        "Правила назв компаній: `services/sheets_preparation_company_format_rules.py` + фрагмент "
-        "`company_name_training.csv`. Посади: embeddings + exact lookup по `title_training.csv` "
-        "(модель `text-embedding-3-small`), інакше фрагмент файлу. Резерв — `step3_prompts.py`."
+        "Бере CSV після кроку 1. OpenAI заповнює дві нові колонки поруч із **Company Name for Emails** і **Title**. "
+        "Під час роботи — прогрес, зупинка між батчами та завантаження часткового результату."
     )
 
     buf_for_ai = st.session_state.get("sheets_prep_buffer_bytes")
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button(
-            "Підставити останній CSV знову",
-            key="sheets_prep_for_ai_reload",
-            help="Підставити останній збережений CSV (після кроку 1, 2, 3 або 4).",
-            disabled=buf_for_ai is None,
-            use_container_width=True,
-        ):
+    st.markdown("**Крок 2 — підставити останній CSV з буфера (повна ширина, як у кроках 3–4):**")
+    if st.button(
+        "Підставити останній CSV знову",
+        key="sheets_prep_for_ai_reload",
+        help="Підставити останній збережений CSV (після кроку 1, 2, 3 або 4).",
+        use_container_width=True,
+    ):
+        if buf_for_ai is None:
+            st.warning(
+                "У буфері сесії ще немає CSV. Виконайте **крок 1** (тоді буфер з’явиться автоматично)."
+            )
+        else:
             st.session_state["sheets_prep_for_ai_bytes"] = bytes(buf_for_ai)
             st.session_state["sheets_prep_for_ai_at"] = datetime.now().isoformat(
                 timespec="seconds"
             )
             st.success("CSV для кроку 2 оновлено.")
-    with c2:
-        loaded_ai = st.session_state.get("sheets_prep_for_ai_bytes")
-        if loaded_ai:
-            ts_ai = st.session_state.get("sheets_prep_for_ai_at") or "—"
-            st.caption(f"Для кроку 2: **{len(loaded_ai):,}** байт · `{ts_ai}`")
+    loaded_ai = st.session_state.get("sheets_prep_for_ai_bytes")
+    if loaded_ai:
+        ts_ai = st.session_state.get("sheets_prep_for_ai_at") or "—"
+        st.caption(f"Для кроку 2: **{len(loaded_ai):,}** байт · `{ts_ai}`")
 
     st.session_state.setdefault("sheets_prep_openai_model", "gpt-4o-mini")
     st.text_input(
@@ -432,12 +453,6 @@ def render_sheets_preparation() -> None:
             ):
                 stop_ev.set()
                 st.rerun()
-            st.info(
-                "**Крок 3 не прихований** — він уже нижче на цій же вкладці. **Прокрутіть сторінку вниз** після цього блоку: "
-                "заголовок **«Крок 3: Website ↔ домен email»** і велика кнопка **«Підставити останній CSV знову»**. "
-                "Після завершення кроку 2 кнопка **«Запустити крок 3»** стане активною, коли в сесії з’явиться CSV "
-                "(автоматично після AI або через **Підставити…** / завантаження файлу)."
-            )
         else:
             st.session_state["sheets_prep_ai_bg_running"] = False
             err = holder.get("error")
@@ -493,7 +508,7 @@ def render_sheets_preparation() -> None:
     st.markdown("### Крок 3: Website ↔ домен email (MathcURLs)")
     st.markdown("**Крок 3 — підставити CSV з буфера:**")
     st.caption(
-        "Як у кроку 2: натисніть велику кнопку нижче, потім **Запустити крок 3**. Буфер оновлюється після кожного кроку 1–4."
+        "Спочатку за потреби розгорніть **Деталі**. Потім — **Підставити останній CSV знову** (буфер після кроків 1–4), далі **Запустити крок 3**."
     )
 
     st.session_state.setdefault("sheets_prep_gate_requested", False)
@@ -502,6 +517,16 @@ def render_sheets_preparation() -> None:
     gate_busy = st.session_state.get("sheets_prep_gate_bg_running", False)
     buf_for_gate = st.session_state.get("sheets_prep_buffer_bytes")
 
+    with st.expander("Деталі: що робить крок 3 (MathcURLs)", expanded=False):
+        st.markdown(
+            "Джерело — поточний CSV після **кроку 2** (`sheets_preparation_out_bytes`). Для рядків із валідним email "
+            "порівнюються **Website** і **домен з адреси** (логіка `vendor/mathcurls`: HTTP, за потреби Chromium). "
+            "Колонка **Domain** — одразу після **Email**, **Results** — одразу після **Domain**. "
+            "У **Results**: «Залишено (Matched / …)» або «Видалено (One of websites is dead / …)» — ті самі статуси, що повертає цей рушій. "
+            "Рядки **без** валідного домена в email: Domain і Results порожні."
+        )
+
+    st.markdown("**Підставити останній CSV з буфера → вхід кроку 3:**")
     if st.button(
         "Підставити останній CSV знову",
         key="sheets_prep_gate_reload",
@@ -528,15 +553,6 @@ def render_sheets_preparation() -> None:
     if _gs:
         _tsg = st.session_state.get("sheets_prep_gate_input_at") or "—"
         st.caption(f"Для кроку 3: **{len(_gs):,}** байт · `{_tsg}`")
-
-    with st.expander("Деталі: що робить крок 3 (MathcURLs)", expanded=False):
-        st.markdown(
-            "Джерело — поточний CSV після **кроку 2** (`sheets_preparation_out_bytes`). Для рядків із валідним email "
-            "порівнюються **Website** і **домен з адреси** (та сама логіка, що на вкладці MathcURLs: HTTP, за потреби Chromium). "
-            "Колонка **Domain** — одразу після **Email**, **Results** — одразу після **Domain**. "
-            "У **Results**: «Залишено (Matched / …)» або «Видалено (One of websites is dead / …)» — той самий текст статусу, що в output MathcURLs. "
-            "Рядки **без** валідного домена в email: Domain і Results порожні."
-        )
 
     gate_src = st.session_state.get("sheets_preparation_out_bytes")
 
@@ -678,32 +694,41 @@ def render_sheets_preparation() -> None:
             st.rerun()
 
     if st.session_state.get("sheets_prep_gate_out_bytes") is not None:
-        st.success("Крок 3 завершено — нижче завантаження CSV з колонками Domain та Results.")
-        st.caption(
-            "Результат збережено в **буфер сесії** — кнопка **«Підставити останній CSV знову»** у **кроку 3** або **кроку 4** підставить цей файл."
-        )
-        tg_ge = st.session_state.get("sheets_prep_gate_tg_err")
-        if tg_ge:
-            st.caption(f"Telegram: {tg_ge}")
-        st.download_button(
-            "Завантажити CSV після кроку 3 (Website ↔ домен)",
-            data=st.session_state["sheets_prep_gate_out_bytes"],
+        st.divider()
+        _render_current_output_preview_and_download(
+            dl_key="sheets_prep_gate_dl",
+            step_label="після кроку 3",
+            data_bytes=st.session_state["sheets_prep_gate_out_bytes"],
+            log_text=st.session_state.get("sheets_prep_gate_log") or "",
+            expander_title="Журнал (крок 3)",
+            download_label="Завантажити CSV після кроку 3 (Website ↔ домен)",
             file_name="sheets_preparation_after_domain_gate.csv",
-            mime="text/csv",
-            key="sheets_prep_gate_dl",
+            show_tg_caption=True,
+            tg_session_key="sheets_prep_gate_tg_err",
+            caption_after_success=(
+                "Додано колонки **Domain** та **Results**. Файл у **буфері сесії** — "
+                "**«Підставити останній CSV знову»** у кроку 3 або 4 підставить цей CSV."
+            ),
         )
-        with st.expander("Журнал (крок 3)", expanded=False):
-            st.code(st.session_state.get("sheets_prep_gate_log") or "", language="text")
 
     st.divider()
     st.markdown("### Крок 4: Видалити погані емейли")
     st.markdown("**Крок 4 — підставити CSV з буфера:**")
     st.caption(
-        "Потрібен файл **після кроку 3** (колонки Domain та Results). Натисніть **Підставити останній CSV знову** — у вхід піде "
-        "останній збережений у сесії CSV (зазвичай це вихід кроку 3). Деталі логіки — у розгорнутому блоці."
+        "Потрібен файл **після кроку 3** (колонки Domain та Results). Спочатку розгорніть **Деталі** за потреби, "
+        "потім натисніть **Підставити останній CSV знову** — у вхід піде останній CSV з буфера (зазвичай вихід кроку 3)."
     )
 
     buf_for_step4 = st.session_state.get("sheets_prep_buffer_bytes")
+
+    with st.expander("Деталі: що робить крок 4", expanded=False):
+        st.markdown(
+            "Якщо в **Results** — «Видалено (One of websites is dead)» або «Видалено (No Redirect or not Match)», "
+            "у цьому рядку очищаються лише **Email** і **Domain**. **Results не змінюємо**. "
+            "Після виконання результат зберігається в **буфер сесії**."
+        )
+
+    st.markdown("**Підставити останній CSV з буфера → вхід кроку 4:**")
     if st.button(
         "Підставити останній CSV знову",
         key="sheets_prep_step4_reload",
@@ -725,13 +750,6 @@ def render_sheets_preparation() -> None:
     if _g4:
         _ts4 = st.session_state.get("sheets_prep_step4_input_at") or "—"
         st.caption(f"Для кроку 4: **{len(_g4):,}** байт · `{_ts4}`")
-
-    with st.expander("Деталі: що робить крок 4", expanded=False):
-        st.markdown(
-            "Якщо в **Results** — «Видалено (One of websites is dead)» або «Видалено (No Redirect or not Match)», "
-            "у цьому рядку очищаються лише **Email** і **Domain**. **Results не змінюємо**. "
-            "Після виконання результат зберігається в **буфер сесії**."
-        )
 
     step4_upload = st.file_uploader(
         "Або завантажте CSV після кроку 3 з диска",
@@ -791,7 +809,7 @@ def render_sheets_preparation() -> None:
             show_tg_caption=True,
             tg_session_key="sheets_prep_step4_tg_err",
             caption_after_success=(
-                "Файл збережено в **буфер сесії** — під кроком 2 кнопка **«Підставити останній CSV знову»** "
+                "Файл збережено в **буфер сесії** — кнопка **«Підставити останній CSV знову»** у **кроках 2, 3 і 4** "
                 "підставить цей CSV."
             ),
         )

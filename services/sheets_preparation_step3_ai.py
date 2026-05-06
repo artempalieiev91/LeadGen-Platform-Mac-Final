@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter, defaultdict
 from collections.abc import Callable
 
 from openai import OpenAI
@@ -17,9 +18,21 @@ from services.sheets_preparation_pipeline import (
     _normalize_header_label,
     parse_csv_bytes,
 )
-from services.sheets_preparation_step3_company_examples import load_company_name_training_block
+from services.sheets_preparation_company_format_rules import COMPANY_NAME_FORMAT_RULES_BLOCK
+from services.sheets_preparation_step3_company_examples import (
+    PROMPT_FEWSHOT_MAX_CHARS,
+    load_company_name_training_block,
+)
 from services.sheets_preparation_step3_prompts import FALLBACK_COMPANY_HINT, FALLBACK_TITLE_HINT
-from services.sheets_preparation_step3_title_examples import load_title_training_block
+from services.sheets_preparation_step3_title_examples import (
+    TITLE_PROMPT_FEWSHOT_MAX_CHARS,
+    load_title_training_block,
+)
+from services.sheets_preparation_title_retrieval import (
+    EMBEDDING_MODEL,
+    get_title_training_index,
+    normalize_title_key,
+)
 from services.sheets_preparation_title_rules import TITLE_PRIORITY_PROMPT_BLOCK
 
 AI_TIMEOUT_SEC = 120
@@ -129,6 +142,48 @@ def _parse_batch_response(raw: str, expected_indices: list[int]) -> dict[int, tu
     return out
 
 
+def _company_name_dedupe_key(raw: str) -> str:
+    """Ключ групування для однакового «Company Name for Emails» (відрізняються лише пробіли)."""
+    return " ".join((raw or "").split())
+
+
+def _canonicalize_right_company_by_input_company(
+    pairs: list[tuple[int, str, str]],
+    filled: dict[int, tuple[str, str]],
+) -> int:
+    """
+    Для однакового значення Company Name for Emails виставляє один Right Company Name на всі рядки групи.
+    Канон: найчастіше непорожнє значення серед відповідей AI; при рівності частот — перше у порядку файлу.
+    Повертає кількість груп, де було більше одного різного непорожнього right_company (для журналу).
+    """
+    key_to_indices: dict[str, list[int]] = defaultdict(list)
+    for i, comp, _tit in pairs:
+        key_to_indices[_company_name_dedupe_key(comp)].append(i)
+
+    merged_groups = 0
+    for indices in key_to_indices.values():
+        row_order_rc = [str(filled.get(idx, ("", ""))[0] or "").strip() for idx in indices]
+        non_empty = [rc for rc in row_order_rc if rc]
+        if not non_empty:
+            canonical = ""
+        else:
+            cnt = Counter(non_empty)
+            best = max(cnt.values())
+            canonical = ""
+            for rc in row_order_rc:
+                if rc and cnt[rc] == best:
+                    canonical = rc
+                    break
+            if len({rc for rc in non_empty}) > 1:
+                merged_groups += 1
+
+        for idx in indices:
+            rt = filled.get(idx, ("", ""))[1]
+            filled[idx] = (canonical, rt)
+
+    return merged_groups
+
+
 def _batch_prompt(
     batch: list[tuple[int, str, str]],
     company_shot: str,
@@ -138,6 +193,8 @@ def _batch_prompt(
     for i, comp, tit in batch:
         lines.append(f'{i}\t{repr(comp)}\t{repr(tit)}')
     return f"""Ти допомагаєш підготувати дані для B2B розсилок. Потрібно відформатувати назви компаній та посади: читабельно, коректний регістр, без зайвих юридичних хвостів у назвах компаній (Inc., LLC тощо — прибирай, якщо це не частина бренду), посади — стандартний діловий стиль.
+
+Якщо в батчі кілька рядків мають однакову назву компанії (той самий рядок після repr) — поле right_company для усіх цих рядків має бути однаковим рядком (однакове написання та регістр).
 
 {company_shot}
 
@@ -206,35 +263,51 @@ def run_step3_ai_format(
     if on_progress:
         on_progress(
             0.0,
-            f"Зчитано **{len(pairs)}** рядків даних. Завантаження CSV-еталонів у промпт (може зайняти кілька секунд)…",
+            f"Зчитано **{len(pairs)}** рядків даних. Підготовка промпта (правила + фрагмент еталонів)…",
         )
 
     if company_few_shot is not None:
         cshot = company_few_shot.strip()
         company_rules_note = "передано параметром"
     else:
-        file_blk = load_company_name_training_block()
-        cshot = file_blk.strip() if file_blk else ""
-        if not cshot:
-            cshot = FALLBACK_COMPANY_HINT.strip()
-            company_rules_note = "резервні правила (CSV з прикладами відсутній або порожній)"
+        base_rules = COMPANY_NAME_FORMAT_RULES_BLOCK.strip()
+        file_blk = load_company_name_training_block(max_chars=PROMPT_FEWSHOT_MAX_CHARS)
+        ex = file_blk.strip() if file_blk else ""
+        if ex:
+            cshot = (
+                base_rules
+                + "\n\nДодаткові еталонні пари з `company_name_training.csv` "
+                f"(фрагмент, до ~{PROMPT_FEWSHOT_MAX_CHARS} символів; при конфліктах пріоритет у цих парах):\n\n"
+                + ex
+            )
+            company_rules_note = (
+                "`sheets_preparation_company_format_rules.py` + фрагмент "
+                f"`company_name_training.csv` (≤{PROMPT_FEWSHOT_MAX_CHARS} симв.)"
+            )
         else:
-            company_rules_note = "файл `services/sheets_prep_data/company_name_training.csv`"
+            cshot = base_rules + "\n\n" + FALLBACK_COMPANY_HINT.strip()
+            company_rules_note = (
+                "`sheets_preparation_company_format_rules.py` + резерв FALLBACK (CSV еталонів немає або порожній)"
+            )
+
+    title_priority_tail = "\n\n" + TITLE_PRIORITY_PROMPT_BLOCK.strip()
+    title_index = get_title_training_index()
 
     if title_few_shot is not None:
-        tshot = title_few_shot.strip()
-        title_rules_note = "передано параметром"
+        tshot_fixed = (title_few_shot.strip() + title_priority_tail).strip()
+        title_strategy = "fixed"
+        title_rules_note = "передано параметром + пріоритети title_rules"
+    elif title_index.is_empty:
+        tshot_fixed = (FALLBACK_TITLE_HINT.strip() + title_priority_tail).strip()
+        title_strategy = "fixed"
+        title_rules_note = "резерв FALLBACK (немає `title_training.csv`) + title_rules"
     else:
-        file_blk_t = load_title_training_block()
-        tshot = file_blk_t.strip() if file_blk_t else ""
-        if not tshot:
-            tshot = FALLBACK_TITLE_HINT.strip()
-            title_rules_note = "резервні правила (CSV з посадами відсутній або порожній)"
-        else:
-            title_rules_note = "файл `services/sheets_prep_data/title_training.csv`"
-
-    tshot = (tshot + "\n\n" + TITLE_PRIORITY_PROMPT_BLOCK.strip()).strip()
-    title_rules_note = f"{title_rules_note} + пріоритети/позначки (title_rules)"
+        tshot_fixed = None
+        title_strategy = "retrieval"
+        title_rules_note = (
+            f"`title_training.csv`: embeddings **{EMBEDDING_MODEL}** (підбір еталонів на батч) "
+            "+ exact lookup + title_rules"
+        )
 
     total_rows = len(pairs)
     total_batches = (total_rows + BATCH_SIZE - 1) // BATCH_SIZE if total_rows else 0
@@ -249,6 +322,23 @@ def run_step3_ai_format(
     configure_openai_http_client(client)
     filled: dict[int, tuple[str, str]] = {}
     stopped_by_user = False
+
+    if title_strategy == "retrieval":
+        try:
+            title_index.embed_corpus(client)
+        except Exception as exc:
+            log.append(
+                f"Embeddings для title_training недоступні ({exc!r}); "
+                f"використано фрагмент CSV (до {TITLE_PROMPT_FEWSHOT_MAX_CHARS} симв.)."
+            )
+            file_blk_t = load_title_training_block(max_chars=TITLE_PROMPT_FEWSHOT_MAX_CHARS)
+            blob = (file_blk_t.strip() if file_blk_t else "") or FALLBACK_TITLE_HINT.strip()
+            tshot_fixed = (blob + title_priority_tail).strip()
+            title_strategy = "fixed"
+            title_rules_note = (
+                f"fallback: фрагмент `title_training.csv` (≤{TITLE_PROMPT_FEWSHOT_MAX_CHARS} симв.) "
+                "після помилки embeddings + title_rules"
+            )
 
     for batch_num, start in enumerate(range(0, len(pairs), BATCH_SIZE), start=1):
         if should_stop and should_stop():
@@ -275,10 +365,33 @@ def run_step3_ai_format(
                 frac_before,
                 f"Запит **{batch_num}** / **{total_batches}**: рядки **{row_from}–{row_to}** з **{total_rows}** (очікування відповіді OpenAI)…",
             )
+        if title_strategy == "retrieval":
+            titles_batch = [c[2] for c in chunk]
+            piece = title_index.build_few_shot_for_queries(client, titles_batch).strip()
+            if not piece:
+                piece = (
+                    "Немає непорожніх тайтлів у батчі для семантичного підбору еталонів; "
+                    "орієнтуйся на правила нижче.\n"
+                )
+            tshot = (piece + title_priority_tail).strip()
+        else:
+            tshot = tshot_fixed or (FALLBACK_TITLE_HINT.strip() + title_priority_tail).strip()
+
         prompt = _batch_prompt(chunk, cshot, tshot)
         raw = _chat_json(client, model, prompt)
         batch_map = _parse_batch_response(raw, indices)
         filled.update(batch_map)
+        if not title_index.is_empty:
+            row_in_chunk = {c[0]: c for c in chunk}
+            for idx in indices:
+                c = row_in_chunk.get(idx)
+                if c is None:
+                    continue
+                tit = c[2]
+                key = normalize_title_key(tit)
+                if key in title_index.exact_map:
+                    rc, _rt = filled.get(idx, ("", ""))
+                    filled[idx] = (rc, title_index.exact_map[key])
         log.append(
             f"AI батч рядків {indices[0] + 1}–{indices[-1] + 1}: отримано {len(batch_map)} записів."
         )
@@ -289,6 +402,13 @@ def run_step3_ai_format(
                 frac_after,
                 f"Запит **{batch_num}** / **{total_batches}** завершено: оброблено **{done_after}** / **{total_rows}** рядків.",
             )
+
+    merged = _canonicalize_right_company_by_input_company(pairs, filled)
+    if merged:
+        log.append(
+            f"Узгоджено Right Company Name для **{merged}** груп з однаковим Company Name for Emails "
+            "(один канонічний варіант на групу після відповідей AI)."
+        )
 
     if on_progress:
         on_progress(1.0, "Збирання CSV з колонками Right Company Name та Right Title…")

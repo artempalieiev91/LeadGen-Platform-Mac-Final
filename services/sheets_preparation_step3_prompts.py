@@ -1,9 +1,10 @@
 """
 Промпти та резервні підказки для кроку 2 AI (Right Company Name / Right Title).
 
-Назви компаній: `services/sheets_prep_data/company_name_training.csv`.
-Посади: `services/sheets_prep_data/title_training.csv`.
-Детальні правила пріоритету посад — `services/sheets_preparation_title_rules.py` (додаються до промпта завжди).
+Назви компаній: явні правила — `services/sheets_preparation_company_format_rules.py`;
+фрагмент еталонів — `services/sheets_prep_data/company_name_training.csv`.
+Посади: `title_training.csv` — embeddings + exact (`sheets_preparation_title_retrieval.py`) або фрагмент при fallback.
+Детальні правила пріоритету посад — `sheets_preparation_title_rules.py` (додаються до промпта завжди).
 Якщо файлів немає — FALLBACK_* нижче.
 """
 

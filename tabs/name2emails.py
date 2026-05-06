@@ -28,6 +28,9 @@ _SHEETS_FOR_AI = "sheets_prep_for_ai_bytes"
 _SHEETS_FOR_AI_AT = "sheets_prep_for_ai_at"
 # Одноразове повідомлення після «Завантажити з буфера»
 _SESSION_BUFFER_LOADED_FLASH = "name2emails_buffer_loaded_flash"
+# Джерело CSV в буфері на момент «Завантажити з буфера»
+_SESSION_BUFFER_LOAD_PROVENANCE = "name2emails_buffer_load_provenance"
+_SESSION_BUFFER_LOAD_AT = "name2emails_buffer_load_at"
 
 _PREVIEW_MAX_ROWS = 10
 
@@ -155,10 +158,27 @@ def render_name2emails() -> None:
             st.session_state[_SESSION_UPLOADER_BYTES] = raw
             st.session_state.pop(_PREPARED_SNAPSHOT, None)
             st.session_state.pop(_SESSION_RUN_READY, None)
+            st.session_state.pop(_SESSION_BUFFER_LOAD_PROVENANCE, None)
+            st.session_state.pop(_SESSION_BUFFER_LOAD_AT, None)
 
     has_sheets_buffer = bool(
         st.session_state.get(_SHEETS_BUFFER) or st.session_state.get(_SHEETS_FOR_AI)
     )
+    if has_sheets_buffer:
+        _buf_src = st.session_state.get("sheets_prep_buffer_source")
+        _buf_ts = st.session_state.get(_SHEETS_BUFFER_AT) or st.session_state.get(_SHEETS_FOR_AI_AT)
+        _prov_parts = []
+        if _buf_src:
+            _prov_parts.append(f"Звідки файл у буфері: {_buf_src}")
+        if _buf_ts:
+            _prov_parts.append(f"час збереження буфера: `{_buf_ts}`")
+        if _prov_parts:
+            st.caption(" · ".join(_prov_parts))
+        else:
+            st.caption(
+                "У буфері є CSV; **мітка джерела** з’явиться після наступного збереження "
+                "у **Sheets Preparation** (крок 1–4) або **Підготовка таблиці** тут."
+            )
     if st.button(
         "Завантажити з буфера",
         key="name2emails_load_from_buffer",
@@ -174,10 +194,18 @@ def render_name2emails() -> None:
             st.session_state.pop(_PREPARED_SNAPSHOT, None)
             st.session_state.pop(_SESSION_RUN_READY, None)
             ts = st.session_state.get(_SHEETS_BUFFER_AT) or st.session_state.get(_SHEETS_FOR_AI_AT)
+            prov = st.session_state.get("sheets_prep_buffer_source")
+            st.session_state[_SESSION_BUFFER_LOAD_PROVENANCE] = prov or ""
+            st.session_state[_SESSION_BUFFER_LOAD_AT] = ts or ""
+            _flash_extra = ""
+            if prov:
+                _flash_extra = f" Звідки (буфер): {prov}"
+            elif ts:
+                _flash_extra = f" (буфер збережено: `{ts}`)"
             st.session_state[_SESSION_BUFFER_LOADED_FLASH] = (
-                f"CSV з **буфера сесії** підставлено в Name2Emails: **{len(b):,}** байт"
-                + (f" (мітка буфера: `{ts}`)" if ts else "")
-                + ". Далі натисніть **Підготовка таблиці**, якщо ще не робили."
+                f"CSV з буфера сесії підставлено в Name2Emails: {len(b):,} байт"
+                + _flash_extra
+                + ". Далі натисніть «Підготовка таблиці», якщо ще не робили."
             )
             st.rerun()
 
@@ -206,7 +234,10 @@ def render_name2emails() -> None:
                 st.session_state[_SESSION_DATA] = nb
                 st.session_state[_SESSION_NAME] = "Input_prepared.csv"
                 st.session_state[_PREPARED_SNAPSHOT] = nb
-                now_s = _write_session_csv_copies(nb)
+                now_s = _write_session_csv_copies(
+                    nb,
+                    source="Name2Emails — після «Підготовка таблиці» (стовпець Emails Research)",
+                )
                 st.session_state[_SHEETS_FOR_AI] = nb
                 st.session_state[_SHEETS_FOR_AI_AT] = now_s
                 st.session_state[_SESSION_RUN_READY] = True
@@ -236,9 +267,14 @@ def render_name2emails() -> None:
         nm = st.session_state.get(_SESSION_NAME) or "Input.csv"
         cap = f"Джерело: **{source_label}** · **{nm}** · {len(csv_bytes):,} байт"
         if source_label == "збережений у сесії" and nm == "Input_from_sheets_buffer.csv":
-            ts = st.session_state.get(_SHEETS_BUFFER_AT)
-            if ts:
-                cap += f" · буфер: `{ts}`"
+            ts_load = st.session_state.get(_SESSION_BUFFER_LOAD_AT)
+            prov_load = (st.session_state.get(_SESSION_BUFFER_LOAD_PROVENANCE) or "").strip()
+            if prov_load:
+                cap += f" · з буфера (Sheets / сесія): {prov_load}"
+            if ts_load:
+                cap += f" · мітка буфера на момент підстановки: `{ts_load}`"
+        elif source_label == "збережений у сесії" and nm == "Input_prepared.csv":
+            cap += " · підготовлено тут (Name2Emails)"
         st.caption(cap)
 
     buf_for_run = st.session_state.get(_SHEETS_BUFFER) or st.session_state.get(_SHEETS_FOR_AI)

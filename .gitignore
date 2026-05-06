@@ -1,0 +1,17 @@
+.streamlit/secrets.toml
+.playwright-browsers/
+.DS_Store
+**/.DS_Store
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.idea/
+scratch_user_companies.*
+*.egg-info/
+dist/
+build/

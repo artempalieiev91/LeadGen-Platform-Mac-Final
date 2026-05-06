@@ -17,6 +17,9 @@ COL_OUT = "Right Company Name"
 # Обмеження розміру блоку в промпті (символи), щоб не перевищувати контекст і вартість.
 DEFAULT_MAX_CHARS = 52_000
 
+# У кроці 2 AI до промпта додаються явні правила + лише фрагмент CSV; цей ліміт — для фрагмента few-shot.
+PROMPT_FEWSHOT_MAX_CHARS = 12_000
+
 
 def load_company_name_training_block(*, max_chars: int = DEFAULT_MAX_CHARS) -> str:
     """

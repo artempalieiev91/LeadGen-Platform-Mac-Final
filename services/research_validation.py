@@ -45,14 +45,22 @@ OUTPUT_COL_RELEVANCE = "Релевантність"
 OUTPUT_COL_DESCRIPTION = "Опис"
 OUTPUT_COL_SOURCE = "Джерело рішення"
 
-# Пояснення для колонки «Джерело рішення»
-SOURCE_STEP1_CSV = "Крок 1 — лише дані з CSV (сайт не завантажувався)"
-SOURCE_STEP2_WEB = "Крок 2 — текст з вебсайту"
-SOURCE_NO_WEBSITE_CELL = "— (порожня колонка Website)"
-SOURCE_STEP1_API_FAIL = "Крок 1 — помилка API"
-SOURCE_STEP2_FETCH_FAIL = "Крок 2 — сторінку не отримано"
-SOURCE_STEP2_API_FAIL = "Крок 2 — помилка API"
-SOURCE_USER_STOPPED = "Обробку зупинено користувачем"
+# Режим порядку аналізу (зберігається в стані Streamlit)
+ANALYSIS_ORDER_FIRST_DESCRIPTION_THEN_WEBSITE = "first_description_then_website"
+ANALYSIS_ORDER_FIRST_WEBSITE_THEN_DESCRIPTION = "first_website_then_description"
+
+# Колонка «Джерело рішення»: без ASCII `;` (зручніше для Excel з роздільником ;)
+SOURCE_DESC_THEN_WEB_STEP1_ONLY = "Лише CSV Short Description і URL без сайту"
+SOURCE_DESC_THEN_WEB_AFTER_SITE = "Текст сайту Contents після маркера потреби сайту"
+SOURCE_WEB_THEN_DESC_SITE_FIRST = "Спочатку текст сайту Contents"
+SOURCE_WEB_THEN_DESC_FALLBACK_CSV_FETCH = "Запасний варіант лише CSV сторінку не отримано"
+SOURCE_WEB_THEN_DESC_FALLBACK_CSV_API = "Запасний варіант лише CSV після помилки AI на сайті"
+SOURCE_WEB_THEN_DESC_FALLBACK_CSV_UNKNOWN = "Запасний варіант лише CSV невизначена відповідь на сайті"
+SOURCE_NO_WEBSITE_CELL = "Порожня колонка Website"
+SOURCE_API_FAIL_CSV_ONLY = "Помилка API при аналізі лише CSV"
+SOURCE_FETCH_FAIL_AFTER_DESC_PATH = "Сторінку не отримано після кроку CSV"
+SOURCE_API_FAIL_SITE_CONTENTS = "Помилка API при аналізі тексту сайту"
+SOURCE_USER_STOPPED = "Зупинено користувачем"
 
 # Частковий результат після зупинки (рядки, що не встигли обробити)
 RV_STOP_STATUS = "Перервано"
@@ -303,6 +311,184 @@ def _stopped_row_triple() -> tuple[str, str, str]:
     return (RV_STOP_STATUS, RV_STOP_DESCRIPTION, SOURCE_USER_STOPPED)
 
 
+def _run_step1_csv_only(
+    client: OpenAI,
+    model: str,
+    user_prompt: str,
+    row_no: int,
+    url: str,
+    rest: str,
+    log_lines: list[str],
+    log_prefix: str,
+) -> tuple[AiOutcome | None, tuple[str, str, str] | None]:
+    """Повертає (outcome, None) або (None, triple) при помилці API."""
+    try:
+        o1 = run_step1_on_row(
+            client,
+            model,
+            user_prompt,
+            f"рядок {row_no}",
+            f"URL: {url}\n{rest}",
+        )
+    except Exception as e:
+        log_lines.append(f"{log_prefix}Рядок {row_no} API (лише CSV): {e}")
+        return None, ("Помилка API", str(e)[:800], SOURCE_API_FAIL_CSV_ONLY)
+    return o1, None
+
+
+def _triple_if_relevant_or_not_relevant(
+    o: AiOutcome,
+    source: str,
+) -> tuple[str, str, str] | None:
+    if o.status == "relevant":
+        return (_status_to_label("relevant"), o.description, source)
+    if o.status == "not_relevant":
+        return (_status_to_label("not_relevant"), o.description, source)
+    return None
+
+
+def _triple_from_step1_outcome(
+    o1: AiOutcome,
+    source: str,
+) -> tuple[str, str, str]:
+    """Для fallback після сайту: relevant / not_relevant / need_site / unknown → рядок CSV."""
+    t = _triple_if_relevant_or_not_relevant(o1, source)
+    if t is not None:
+        return t
+    if o1.status == "need_site":
+        return (_status_to_label("need_site"), o1.description, source)
+    return (_status_to_label("unknown"), o1.description or "", source)
+
+
+def _process_desc_then_website(
+    client: OpenAI,
+    model: str,
+    user_prompt: str,
+    header: list[str],
+    cells: list[str],
+    idx: int,
+    n: int,
+    website_idx: int,
+    short_desc_idx: int,
+    log_lines: list[str],
+    on_progress: Callable[[float, str], None] | None,
+) -> tuple[str, str, str]:
+    """Спочатку лише CSV (опис + URL). Потім за потреби сайт + Contents: (як раніше)."""
+    row_no = idx + 1
+
+    def log(msg: str) -> None:
+        log_lines.append(msg)
+
+    if on_progress:
+        on_progress((idx + 1) / max(n, 1), f"Рядок {row_no} / {n}")
+
+    url, rest = _row_to_url_and_short_description(header, cells, website_idx, short_desc_idx)
+    if not url:
+        log(f"Рядок {row_no}: порожня колонка Website")
+        return ("Помилка", f"Порожня колонка «{WEBSITE_COLUMN_NAME}»", SOURCE_NO_WEBSITE_CELL)
+
+    o1, err_t = _run_step1_csv_only(
+        client, model, user_prompt, row_no, url, rest, log_lines, ""
+    )
+    if err_t is not None:
+        return err_t
+    assert o1 is not None
+    dsc_preview = (o1.description[:120] + "…") if len(o1.description) > 120 else o1.description
+    log(f"Рядок {row_no} [лише CSV]: {o1.status} — {dsc_preview}")
+
+    t = _triple_if_relevant_or_not_relevant(o1, SOURCE_DESC_THEN_WEB_STEP1_ONLY)
+    if t is not None:
+        return t
+
+    log(f"Крок Contents: завантаження {url}")
+    page_text = fetch_site_text(url)
+    if not page_text:
+        log("  → порожній контент")
+        return (
+            "Не релевантна / немає тексту",
+            "Не вдалося завантажити сторінку",
+            SOURCE_FETCH_FAIL_AFTER_DESC_PATH,
+        )
+    try:
+        o2 = run_step2_on_site_text(client, model, user_prompt, page_text)
+    except Exception as e:
+        log(f"  → API помилка: {e}")
+        return ("Помилка API", str(e)[:800], SOURCE_API_FAIL_SITE_CONTENTS)
+    log(f"  → {o2.status}")
+    if o2.status == "relevant":
+        return (_status_to_label("relevant"), o2.description, SOURCE_DESC_THEN_WEB_AFTER_SITE)
+    if o2.status == "not_relevant":
+        return (_status_to_label("not_relevant"), o2.description, SOURCE_DESC_THEN_WEB_AFTER_SITE)
+    return (_status_to_label("unknown"), o2.description or "", SOURCE_DESC_THEN_WEB_AFTER_SITE)
+
+
+def _process_website_then_description(
+    client: OpenAI,
+    model: str,
+    user_prompt: str,
+    header: list[str],
+    cells: list[str],
+    idx: int,
+    n: int,
+    website_idx: int,
+    short_desc_idx: int,
+    log_lines: list[str],
+    on_progress: Callable[[float, str], None] | None,
+) -> tuple[str, str, str]:
+    """Спочатку fetch + AI по Contents:. При невдачі — той самий аналіз лише по CSV."""
+    row_no = idx + 1
+
+    def log(msg: str) -> None:
+        log_lines.append(msg)
+
+    if on_progress:
+        on_progress((idx + 1) / max(n, 1), f"Рядок {row_no} / {n}")
+
+    url, rest = _row_to_url_and_short_description(header, cells, website_idx, short_desc_idx)
+    if not url:
+        log(f"Рядок {row_no}: порожня колонка Website")
+        return ("Помилка", f"Порожня колонка «{WEBSITE_COLUMN_NAME}»", SOURCE_NO_WEBSITE_CELL)
+
+    log(f"Рядок {row_no}: режим спочатку сайт — завантаження {url}")
+    page_text = fetch_site_text(url)
+    if not page_text:
+        log("  → порожній контент, запасний варіант лише CSV")
+        o_fb, err_t = _run_step1_csv_only(
+            client, model, user_prompt, row_no, url, rest, log_lines, "  → fallback: "
+        )
+        if err_t is not None:
+            return err_t
+        assert o_fb is not None
+        return _triple_from_step1_outcome(o_fb, SOURCE_WEB_THEN_DESC_FALLBACK_CSV_FETCH)
+
+    try:
+        o2 = run_step2_on_site_text(client, model, user_prompt, page_text)
+    except Exception as e:
+        log(f"  → API на тексті сайту: {e}, запасний варіант лише CSV")
+        o_fb, err_t = _run_step1_csv_only(
+            client, model, user_prompt, row_no, url, rest, log_lines, "  → fallback: "
+        )
+        if err_t is not None:
+            return err_t
+        assert o_fb is not None
+        return _triple_from_step1_outcome(o_fb, SOURCE_WEB_THEN_DESC_FALLBACK_CSV_API)
+
+    log(f"  → після сайту: {o2.status}")
+    if o2.status == "relevant":
+        return (_status_to_label("relevant"), o2.description, SOURCE_WEB_THEN_DESC_SITE_FIRST)
+    if o2.status == "not_relevant":
+        return (_status_to_label("not_relevant"), o2.description, SOURCE_WEB_THEN_DESC_SITE_FIRST)
+
+    log("  → невизначено після сайту, запасний варіант лише CSV")
+    o_fb, err_t = _run_step1_csv_only(
+        client, model, user_prompt, row_no, url, rest, log_lines, "  → fallback: "
+    )
+    if err_t is not None:
+        return err_t
+    assert o_fb is not None
+    return _triple_from_step1_outcome(o_fb, SOURCE_WEB_THEN_DESC_FALLBACK_CSV_UNKNOWN)
+
+
 def _process_one_data_row_merged(
     client: OpenAI,
     model: str,
@@ -316,61 +502,35 @@ def _process_one_data_row_merged(
     col_map: dict[str, int],
     log_lines: list[str],
     on_progress: Callable[[float, str], None] | None,
+    analysis_order: str,
 ) -> tuple[str, str, str]:
-    """Один рядок: крок 1 (CSV) і за потреби крок 2 (сайт) — як послідовні два проходи, але без проміжного маркера __STEP2__."""
-    row_no = idx + 1
-
-    def log(msg: str) -> None:
-        log_lines.append(msg)
-
-    if on_progress:
-        on_progress((idx + 1) / max(n, 1), f"Рядок {row_no} / {n}")
-
-    url, rest = _row_to_url_and_short_description(header, cells, website_idx, short_desc_idx)
-    if not url:
-        log(f"Рядок {row_no}: порожня колонка Website — крок 2 не застосовується")
-        return ("Помилка", f"Порожня колонка «{WEBSITE_COLUMN_NAME}»", SOURCE_NO_WEBSITE_CELL)
-
-    try:
-        o1 = run_step1_on_row(
+    if analysis_order == ANALYSIS_ORDER_FIRST_WEBSITE_THEN_DESCRIPTION:
+        return _process_website_then_description(
             client,
             model,
             user_prompt,
-            f"рядок {row_no}",
-            f"URL: {url}\n{rest}",
+            header,
+            cells,
+            idx,
+            n,
+            website_idx,
+            short_desc_idx,
+            log_lines,
+            on_progress,
         )
-    except Exception as e:
-        log(f"Рядок {row_no} крок 1 API: {e}")
-        return ("Помилка API", str(e)[:800], SOURCE_STEP1_API_FAIL)
-
-    dsc_preview = (o1.description[:120] + "…") if len(o1.description) > 120 else o1.description
-    log(f"Рядок {row_no} [крок 1]: {o1.status} — {dsc_preview}")
-
-    if o1.status == "relevant":
-        return (_status_to_label("relevant"), o1.description, SOURCE_STEP1_CSV)
-    if o1.status == "not_relevant":
-        return (_status_to_label("not_relevant"), o1.description, SOURCE_STEP1_CSV)
-
-    log(f"Крок 2: завантаження {url}")
-    page_text = fetch_site_text(url)
-    if not page_text:
-        log("  → порожній контент")
-        return (
-            "Не релевантна / немає тексту",
-            "Не вдалося завантажити сторінку",
-            SOURCE_STEP2_FETCH_FAIL,
-        )
-    try:
-        o2 = run_step2_on_site_text(client, model, user_prompt, page_text)
-    except Exception as e:
-        log(f"  → API помилка: {e}")
-        return ("Помилка API", str(e)[:800], SOURCE_STEP2_API_FAIL)
-    log(f"  → {o2.status}")
-    if o2.status == "relevant":
-        return (_status_to_label("relevant"), o2.description, SOURCE_STEP2_WEB)
-    if o2.status == "not_relevant":
-        return (_status_to_label("not_relevant"), o2.description, SOURCE_STEP2_WEB)
-    return (_status_to_label("unknown"), o2.description or "", SOURCE_STEP2_WEB)
+    return _process_desc_then_website(
+        client,
+        model,
+        user_prompt,
+        header,
+        cells,
+        idx,
+        n,
+        website_idx,
+        short_desc_idx,
+        log_lines,
+        on_progress,
+    )
 
 
 def _results_to_csv_bytes(
@@ -431,6 +591,7 @@ def _run_merged_pipeline(
     on_progress: Callable[[float, str], None] | None,
     log_lines: list[str],
     stop_check: Callable[[], bool] | None,
+    analysis_order: str,
 ) -> tuple[bytes, str]:
     n = len(data_rows)
     results: list[tuple[str, str, str]] = []
@@ -464,6 +625,7 @@ def _run_merged_pipeline(
                 col_map,
                 log_lines,
                 on_progress,
+                analysis_order,
             )
         )
 
@@ -475,7 +637,11 @@ def _run_merged_pipeline(
     return _results_to_csv_bytes(header, data_rows, website_idx, col_map, results, log_lines)
 
 
-def research_validation_validate_and_init_state(csv_bytes: bytes) -> dict:
+def research_validation_validate_and_init_state(
+    csv_bytes: bytes,
+    *,
+    analysis_order: str = ANALYSIS_ORDER_FIRST_DESCRIPTION_THEN_WEBSITE,
+) -> dict:
     """
     Парсить CSV і готує стан для покрокової обробки (Streamlit: кілька rerun між блоками рядків).
     """
@@ -492,12 +658,18 @@ def research_validation_validate_and_init_state(csv_bytes: bytes) -> dict:
             "у виході будуть порожні клітинки, але заголовки перших двох колонок все одно присутні."
         )
     col_map = _column_index_map(header)
+    if analysis_order not in (
+        ANALYSIS_ORDER_FIRST_DESCRIPTION_THEN_WEBSITE,
+        ANALYSIS_ORDER_FIRST_WEBSITE_THEN_DESCRIPTION,
+    ):
+        analysis_order = ANALYSIS_ORDER_FIRST_DESCRIPTION_THEN_WEBSITE
     return {
         "header": header,
         "data_rows": data_rows,
         "website_idx": website_idx,
         "short_desc_idx": short_desc_idx,
         "col_map": col_map,
+        "analysis_order": analysis_order,
         "results": [],
         "next_idx": 0,
         "log_lines": [],
@@ -524,6 +696,10 @@ def research_validation_state_step(
     col_map = state["col_map"]
     log_lines: list[str] = state["log_lines"]
     results: list[tuple[str, str, str]] = state["results"]
+    analysis_order = state.get(
+        "analysis_order",
+        ANALYSIS_ORDER_FIRST_DESCRIPTION_THEN_WEBSITE,
+    )
 
     processed = 0
     while processed < max_rows and state["next_idx"] < n:
@@ -541,6 +717,7 @@ def research_validation_state_step(
             col_map,
             log_lines,
             on_progress,
+            analysis_order,
         )
         results.append(triple)
         state["next_idx"] = idx + 1
@@ -579,6 +756,8 @@ def run_research_validation(
     api_key: str,
     on_progress: Callable[[float, str], None] | None = None,
     stop_check: Callable[[], bool] | None = None,
+    *,
+    analysis_order: str = ANALYSIS_ORDER_FIRST_DESCRIPTION_THEN_WEBSITE,
 ) -> tuple[bytes, str]:
     """Повертає CSV: LinkedIn URL, Apollo Id, Вебсайт, Релевантність, Джерело рішення, Опис; плюс журнал."""
     log_lines: list[str] = []
@@ -596,4 +775,5 @@ def run_research_validation(
         on_progress,
         log_lines,
         stop_check,
+        analysis_order,
     )

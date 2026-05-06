@@ -8,8 +8,12 @@ from __future__ import annotations
 import csv
 import io
 import re
+from pathlib import Path
 
 from services.sheets_preparation_industry_map import INDUSTRY_MAPPING
+
+# Перша колонка кроку 1 — мітка вихідного файлу (кілька CSV)
+SOURCE_CSV_COLUMN = "Source CSV"
 
 # Порядок ключових стовпців як у reorderColumnsCustom(); решта колонок інпуту відкидаються.
 COLUMN_ORDER: list[str] = [
@@ -46,12 +50,27 @@ APOLLO_ACCOUNT_ID_INPUT_ALIASES: tuple[str, ...] = (
     "Apollo Account ID",
 )
 
-# Повний заголовок результату кроку 1: ключові + Apollo Contact Id + Apollo Account Id.
+# Повний заголовок результату кроку 1: Source CSV + ключові + Apollo Contact Id + Apollo Account Id.
 OUTPUT_COLUMN_ORDER: list[str] = [
+    SOURCE_CSV_COLUMN,
     *COLUMN_ORDER,
     APOLLO_CONTACT_ID_COLUMN,
     APOLLO_ACCOUNT_ID_COLUMN,
 ]
+
+
+def unique_source_labels_from_filenames(filenames: list[str]) -> list[str]:
+    """
+    Ім'я без .csv; при однакових stem — друга «name (2)», третя «name (3)» (з пробілом перед дужками).
+    """
+    stems = [Path(n or "").stem or "(no name)" for n in filenames]
+    counts: dict[str, int] = {}
+    out: list[str] = []
+    for stem in stems:
+        n = counts.get(stem, 0) + 1
+        counts[stem] = n
+        out.append(stem if n == 1 else f"{stem} ({n})")
+    return out
 
 
 def _normalize_header_label(s: str) -> str:
@@ -99,10 +118,14 @@ def _cell_at(full_row: list[str | None], row_width: int, col_idx: int | None) ->
     return "" if v is None else str(v)
 
 
-def project_key_columns_and_apollo(rows: list[list[str]]) -> tuple[list[list[str]], str | None, list[str]]:
+def project_key_columns_and_apollo(
+    rows: list[list[str]],
+    *,
+    source_label: str = "",
+) -> tuple[list[list[str]], str | None, list[str]]:
     """
     З широкого CSV залишає лише COLUMN_ORDER (відсутні ключі → порожні клітинки),
-    додає в кінець Apollo Contact Id та Apollo Account Id з відповідних колонок інпуту (якщо були).
+    додає на початок Source CSV і в кінець Apollo Contact Id та Apollo Account Id (якщо були в інпуті).
     """
     detail: list[str] = []
     if not rows:
@@ -149,7 +172,7 @@ def project_key_columns_and_apollo(rows: list[list[str]]) -> tuple[list[list[str
         key_vals = [_cell_at(padded, row_width, ix) for ix in key_indices]
         apollo_contact_val = _cell_at(padded, row_width, apollo_contact_ix)
         apollo_account_val = _cell_at(padded, row_width, apollo_account_ix)
-        out_rows.append([*key_vals, apollo_contact_val, apollo_account_val])
+        out_rows.append([source_label, *key_vals, apollo_contact_val, apollo_account_val])
 
     return out_rows, None, detail
 
@@ -275,24 +298,7 @@ def clean_domains(rows: list[list[str]]) -> None:
                 row[ci] = remove_url_prefixes(str(row[ci]))
 
 
-def run_sheets_preparation_pipeline(rows: list[list[str]]) -> tuple[list[list[str]], str | None, list[str]]:
-    """
-    Еквівалент automateProcess(): ключові стовпці + Apollo Contact Id + Apollo Account Id → fillPersonLocation → updateIndustry → cleanDomains.
-    Крок removeUnwantedHyperlinks для плоского CSV не застосовується (лише формат Sheets).
-    """
-    log: list[str] = []
-    if not rows:
-        return [], "Файл порожній або без рядків.", log
-
-    new_rows, err, project_detail = project_key_columns_and_apollo(rows)
-    if err:
-        return rows, err, log
-    rows = new_rows
-    log.append(
-        "З широкого інпуту залишено лише ключові стовпці; у кінці — Apollo Contact Id та Apollo Account Id (з інпуту, якщо були колонки)."
-    )
-    log.extend(project_detail)
-
+def _run_sheets_post_projection(rows: list[list[str]], log: list[str]) -> None:
     fill_person_location(rows)
     log.append("Заповнено Country / State / City (правила fillPersonLocation).")
 
@@ -304,4 +310,67 @@ def run_sheets_preparation_pipeline(rows: list[list[str]]) -> tuple[list[list[st
 
     log.append("removeUnwantedHyperlinks: для CSV пропущено (у Google Sheets знімає формат гіперпосилань).")
 
+
+def run_sheets_preparation_pipeline(
+    rows: list[list[str]],
+    *,
+    source_label: str = "",
+) -> tuple[list[list[str]], str | None, list[str]]:
+    """
+    Еквівалент automateProcess(): Source CSV + ключові + Apollo → fillPersonLocation → updateIndustry → cleanDomains.
+    Крок removeUnwantedHyperlinks для плоского CSV не застосовується (лише формат Sheets).
+    """
+    log: list[str] = []
+    if not rows:
+        return [], "Файл порожній або без рядків.", log
+
+    new_rows, err, project_detail = project_key_columns_and_apollo(rows, source_label=source_label)
+    if err:
+        return rows, err, log
+    rows = new_rows
+    log.append(
+        "З широкого інпуту залишено лише ключові стовпці; на початку — Source CSV; у кінці — Apollo Contact Id та Apollo Account Id (з інпуту, якщо були колонки)."
+    )
+    log.extend(project_detail)
+
+    _run_sheets_post_projection(rows, log)
     return rows, None, log
+
+
+def run_sheets_preparation_pipeline_multi(
+    files: list[tuple[bytes, str]],
+) -> tuple[list[list[str]], str | None, list[str]]:
+    """
+    Кілька CSV: один спільний заголовок, рядки з усіх файлів підряд. Перша колонка — Source CSV.
+    """
+    log: list[str] = []
+    if not files:
+        return [], "Оберіть хоча б один CSV.", log
+
+    names = [n for _, n in files]
+    labels = unique_source_labels_from_filenames(names)
+    merged: list[list[str]] | None = None
+    total_data = 0
+
+    for (data, name), label in zip(files, labels):
+        rows = parse_csv_bytes(data)
+        if not rows:
+            return [], f"Файл «{name}» порожній або без рядків.", log
+        proj, err, project_detail = project_key_columns_and_apollo(rows, source_label=label)
+        if err:
+            return [], f"«{name}»: {err}", log
+        n_here = max(0, len(proj) - 1)
+        total_data += n_here
+        log.append(f"Файл «{name}» → Source CSV «{label}», рядків даних: {n_here}.")
+        log.extend(project_detail)
+        if merged is None:
+            merged = proj
+        else:
+            if not proj or proj[0] != merged[0]:
+                return [], "Внутрішня помилка: заголовки після проєкції не збігаються.", log
+            merged.extend(proj[1:])
+
+    assert merged is not None
+    log.insert(0, f"Об’єднано {len(files)} файл(ів), усього рядків даних: {total_data}.")
+    _run_sheets_post_projection(merged, log)
+    return merged, None, log

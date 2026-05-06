@@ -11,7 +11,6 @@ from services.platform_openai import (
     save_openai_key_to_keyring,
 )
 from services.telegram_notify import send_connect_test_message
-from tabs.mathcurls import render_mathcurls
 from tabs.name2emails import render_name2emails
 from tabs.research_validation import render_research_validation
 from tabs.sheets_preparation import render_sheets_preparation
@@ -101,8 +100,8 @@ with oc2:
         st.rerun()
 st.markdown("---")
 
-tab_rv, tab_sheets, tab_math, tab_n2e = st.tabs(
-    ["Research Validation", "Sheets Preparation", "MathcURLs", "Name2Emails"]
+tab_rv, tab_sheets, tab_n2e = st.tabs(
+    ["Research Validation", "Sheets Preparation", "Name2Emails"]
 )
 
 with tab_rv:
@@ -110,9 +109,6 @@ with tab_rv:
 
 with tab_sheets:
     render_sheets_preparation()
-
-with tab_math:
-    render_mathcurls()
 
 with tab_n2e:
     render_name2emails()

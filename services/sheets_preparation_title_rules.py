@@ -14,6 +14,13 @@ TITLE_PRIORITY_PROMPT_BLOCK = """
 
 **Словник:** форми бери з еталонів у цьому промпті (`title_training.csv`). Якщо вхід неоднозначний — обери канон, який уже є в еталонах для подібного випадку.
 
+**Фіксовані пари** (якщо вхідний Title збігається з лівою колонкою — саме такий `right_title`):
+- Head of Technical Operations → Head of Operations
+- Head of Internal Development → Head of Development
+- Directie (CPO) → CPO
+- Chief Clinical Information Officer → CIO
+- Advertising Operations Director → Director of Operations
+
 **Не знижуй і не міняй рівень посади без еталону:** якщо у вхідному Title є **Director** / **VP** / **Senior Director** тощо — у `right_title` має лишатися **відповідний рівень** з еталонів (наприклад *Director of Product*, *VP of …*). **Не** замінюй Director на **Head of …**, VP на **Manager**, якщо в парах для подібних формулювань у словнику зазначено Director/VP. *Head* і *Director* у еталонах — **різні** канони; не підміняй їх одне одним «на око».
 
 **Якщо не впевнений:** немає близької пари в еталонах і не можеш чесно взяти **існуючий** канон зі словника — поверни **`right_title` порожнім** (краще порожньо, ніж вигаданий або помилковий тайтл).

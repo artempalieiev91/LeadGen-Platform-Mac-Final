@@ -16,6 +16,9 @@ COL_OUT = "Right Title"
 
 DEFAULT_MAX_CHARS = 52_000
 
+# Резервний ліміт few-shot, якщо embeddings недоступні (fallback).
+TITLE_PROMPT_FEWSHOT_MAX_CHARS = 12_000
+
 
 def load_title_training_block(*, max_chars: int = DEFAULT_MAX_CHARS) -> str:
     """

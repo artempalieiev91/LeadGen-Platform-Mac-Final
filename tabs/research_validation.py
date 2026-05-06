@@ -8,6 +8,8 @@ import streamlit as st
 
 from services.keep_awake import prevent_idle_sleep
 from services.research_validation import (
+    ANALYSIS_ORDER_FIRST_DESCRIPTION_THEN_WEBSITE,
+    ANALYSIS_ORDER_FIRST_WEBSITE_THEN_DESCRIPTION,
     MARKER_NEED_SITE,
     MARKER_NOT_RELEVANT,
     MARKER_RELEVANT,
@@ -38,20 +40,19 @@ def render_research_validation() -> None:
 
     st.markdown(
         f"""
-**Як працює інструмент.** Ключ OpenAI вводиться **на головній сторінці** (блок OpenAI під «LeadGen Platform») або через Secrets. Далі оберіть **модель**, додайте або оберіть **промпт**.  
-Завантажте **CSV**: обов’язково **Website** та **Short Description**. Колонки **Company Linkedin Url** і **Apollo Account Id** у файлі можна не вказувати — тоді вони будуть порожні в результаті; якщо є — підставляться з інпуту. У модель на крок 1 йдуть лише Website та Short Description.
+**Як працює інструмент.** Ключ OpenAI вводиться **на головній сторінці** (блок OpenAI під «LeadGen Platform») або через Secrets. Далі оберіть **модель**, додайте або оберіть **промпт**.
 
-**Крок 1:** модель оцінює рядок лише за вашими даними й промптом. У відповіді мають бути маркери  
-`{MARKER_RELEVANT}`, `{MARKER_NOT_RELEVANT}` або `{MARKER_NEED_SITE}` (якщо без сайту вирішити не можна).
+Завантажте **CSV** з колонками **Website** та **Short Description**. **Company Linkedin Url** і **Apollo Account Id** можна не мати — тоді у виході колонки 1–2 порожні, інакше значення **копіюються з того ж рядка** за назвою заголовка.
 
-**Крок 2:** для рядків із `{MARKER_NEED_SITE}` (або без чітких маркерів) підтягується текст сайту, як у скрипті  
-[OpenAI4omini-Python-Mac](https://github.com/artempalieiev91/OpenAI4omini-Python-Mac) (`Contents:` + текст сторінки).
+**Порядок аналізу** обирається нижче в блоці «CSV і запуск» (дві англомовні опції). Маркери в відповіді: `{MARKER_RELEVANT}`, `{MARKER_NOT_RELEVANT}`, `{MARKER_NEED_SITE}`. Формат сайту в промпті як у [OpenAI4omini-Python-Mac](https://github.com/artempalieiev91/OpenAI4omini-Python-Mac): **`Contents:`** + текст сторінки.
 
-Результат — завжди **6 колонок**: LinkedIn і Apollo **копіюються з того ж рядка**, що й у вхідному CSV (пошук колонок за назвою, без «очищення» рядка). Далі — Вебсайт, Релевантність, Джерело рішення, Опис.
+**Вихідний CSV — завжди 6 колонок** (порядок фіксований): **1** Company Linkedin Url · **2** Apollo Account Id · **3** Вебсайт (копія Website) · **4** Релевантність (для чіткого рішення **Так** / **Ні**, інакше службові статуси) · **5** Джерело рішення (сайт, лише CSV, запасний варіант після помилки — **без крапки з комою** в тексті, щоб Excel з роздільником `;` не з’їхав) · **6** Опис (маркери з відповіді прибираються).
 
-Під час довгої обробки можна **зупинити** — зберігаються вже готові рядки; решта позначаються як «Перервано». Зупинка застосовується **між блоками** рядків (див. «рядків за крок»); поточний блок дораховується до кінця.
+Зберігайте результат як **UTF-8**; у Excel при імпорті вкажіть правильний роздільник (зазвичай **кома** для звичайного CSV). **Не перейменовуйте** ці шість заголовків, якщо далі йдуть інші кроки чи скрипти.
 
-**Якщо вимкнути комп’ютер або засне ОС:** локальний Streamlit і Python зупиняються — скрипти **не** продовжують працювати. Потрібен постійно увімкнений сервер або вимкнення сну на час задачі.
+Під час довгої обробки можна **зупинити** — зберігаються вже готові рядки; решта позначаються як «Перервано». Зупинка між **блоками** рядків (див. «рядків за крок»).
+
+**Якщо вимкнути комп’ютер або засне ОС:** локальний Streamlit зупиняється — потрібен сервер або вимкнення сну на час задачі.
         """
     )
 
@@ -170,6 +171,23 @@ def render_research_validation() -> None:
     st.divider()
     st.markdown("### CSV і запуск")
 
+    st.radio(
+        "Порядок аналізу",
+        options=[
+            ANALYSIS_ORDER_FIRST_DESCRIPTION_THEN_WEBSITE,
+            ANALYSIS_ORDER_FIRST_WEBSITE_THEN_DESCRIPTION,
+        ],
+        format_func=lambda v: (
+            "First Description, then Website"
+            if v == ANALYSIS_ORDER_FIRST_DESCRIPTION_THEN_WEBSITE
+            else "First Website, then Description"
+        ),
+        key="rv_analysis_order",
+        disabled=st.session_state.get("rv_active", False),
+        help="First Description: спочатку лише Short Description і URL з рядка, за потреби — сайт і Contents. "
+        "First Website: спочатку завантаження сторінки та AI по тексту, при невдачі — запасний аналіз лише по CSV.",
+    )
+
     uploaded = st.file_uploader("Вхідний CSV", type=["csv"], key="rv_csv_uploader")
 
     if uploaded is not None:
@@ -221,7 +239,13 @@ def render_research_validation() -> None:
             st.error("Немає даних CSV. Завантажте файл знову.")
             return
         try:
-            st.session_state["rv_state"] = research_validation_validate_and_init_state(csv_bytes)
+            st.session_state["rv_state"] = research_validation_validate_and_init_state(
+                csv_bytes,
+                analysis_order=st.session_state.get(
+                    "rv_analysis_order",
+                    ANALYSIS_ORDER_FIRST_DESCRIPTION_THEN_WEBSITE,
+                ),
+            )
         except Exception as exc:
             st.error(f"Помилка CSV: {exc}")
             return
